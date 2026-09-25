@@ -13,10 +13,10 @@ from app.schemas.dataset import (
     DataGradeStats, QualityGradeRequest, ReviewStatusStats
 )
 from app.services.scoring import (
+    GradePolicyError,
     calculate_completeness_score,
-    calculate_annotation_quality_score,
-    determine_grade,
-    compute_operation_quality
+    compute_operation_quality,
+    validate_grading_policy
 )
 from app.services.aggregation import compute_group_stats
 
@@ -29,48 +29,71 @@ def grade_operation_data(
     operation_ids: Optional[List[int]] = Query(None, description="指定作业ID列表，空则处理全部"),
     db: Session = Depends(get_db)
 ):
-    if req.completeness_weight + req.annotation_weight != 1.0:
-        raise HTTPException(status_code=400, detail="完整度权重和标注质量权重之和必须为1.0")
-
-    query = db.query(OperationData)
-    if operation_ids:
-        query = query.filter(OperationData.id.in_(operation_ids))
-    operations = query.all()
-
-    thresholds = {
-        "grade_a": req.grade_a_threshold,
-        "grade_b": req.grade_b_threshold,
-        "grade_c": req.grade_c_threshold
-    }
-
-    graded_count = 0
-    for op in operations:
-        annotation = db.query(Annotation).filter(
-            Annotation.operation_data_id == op.id
-        ).first()
-
-        scores = compute_operation_quality(
-            operation=op,
-            annotation=annotation,
+    # 1) 先完整校验分级策略：权重取值区间、权重和容差、阈值严格递减，
+    #    所有无效字段一次性返回，策略不合法时不修改任何数据
+    try:
+        policy = validate_grading_policy(
             completeness_weight=req.completeness_weight,
             annotation_weight=req.annotation_weight,
-            thresholds=thresholds
+            grade_a_threshold=req.grade_a_threshold,
+            grade_b_threshold=req.grade_b_threshold,
+            grade_c_threshold=req.grade_c_threshold
+        )
+    except GradePolicyError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "质量分级策略无效", "invalid_fields": exc.errors}
         )
 
-        op.completeness_score = scores.completeness_score
-        op.quality_score = scores.quality_score
-        op.data_grade = scores.data_grade
-        graded_count += 1
+    # 2) 再校验目标作业：指定的编号必须全部存在，否则不执行任何分级
+    if operation_ids:
+        operations = db.query(OperationData).filter(OperationData.id.in_(operation_ids)).all()
+        found_ids = {op.id for op in operations}
+        missing_ids = [op_id for op_id in operation_ids if op_id not in found_ids]
+        if missing_ids:
+            raise HTTPException(
+                status_code=400,
+                detail={"message": "部分作业数据不存在，未执行任何分级", "invalid_operation_ids": missing_ids}
+            )
+    else:
+        operations = db.query(OperationData).all()
 
-    db.commit()
+    # 3) 全部输入合法后，先在内存中算完全部分数（纯计算，不写库），
+    # 4) 再一次提交全部更新；中途任何异常都回滚，不会留下只更新了一半的数据
+    try:
+        annotations = {}
+        if operations:
+            annotation_rows = db.query(Annotation).filter(
+                Annotation.operation_data_id.in_([op.id for op in operations])
+            ).all()
+            annotations = {row.operation_data_id: row for row in annotation_rows}
+
+        computed = [
+            (op, compute_operation_quality(op, annotations.get(op.id), policy))
+            for op in operations
+        ]
+
+        for op, scores in computed:
+            op.completeness_score = scores.completeness_score
+            op.quality_score = scores.quality_score
+            op.data_grade = scores.data_grade
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={"message": "质量分级过程中发生异常，已回滚全部修改", "error": str(exc)}
+        )
 
     grade_counts = {"A": 0, "B": 0, "C": 0, "D": 0}
-    for op in operations:
-        if op.data_grade in grade_counts:
-            grade_counts[op.data_grade] += 1
+    for _, scores in computed:
+        grade_counts[scores.data_grade] += 1
 
     return {
-        "message": f"已完成 {graded_count} 条数据的质量分级",
+        "message": f"已完成 {len(computed)} 条数据的质量分级",
+        "graded_count": len(computed),
         "grade_distribution": grade_counts
     }
 

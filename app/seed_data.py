@@ -545,7 +545,7 @@ def seed_data():
         db.commit()
         print(f"已创建 {len(created_datasets)} 个数据集及其复用记录")
 
-        from app.routers.analytics import calculate_completeness_score, determine_grade
+        from app.services.scoring import calculate_completeness_score, determine_grade
 
         all_ops = db.query(OperationData).all()
         thresholds = {"grade_a": 0.9, "grade_b": 0.7, "grade_c": 0.5}
