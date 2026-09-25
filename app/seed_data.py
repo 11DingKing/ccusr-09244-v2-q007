@@ -545,7 +545,11 @@ def seed_data():
         db.commit()
         print(f"已创建 {len(created_datasets)} 个数据集及其复用记录")
 
-        from app.routers.analytics import calculate_completeness_score, determine_grade
+        from app.services.scoring import (
+            calculate_annotation_quality_score,
+            calculate_completeness_score,
+            determine_grade,
+        )
 
         all_ops = db.query(OperationData).all()
         thresholds = {"grade_a": 0.9, "grade_b": 0.7, "grade_c": 0.5}
@@ -553,17 +557,7 @@ def seed_data():
             completeness = calculate_completeness_score(op)
             op.completeness_score = round(completeness, 4)
 
-            annotation_quality = 0.0
-            if op.annotation:
-                ann = op.annotation
-                base = 0.6
-                if ann.review_status == "approved":
-                    base += 0.2
-                if ann.annotation_quality_score is not None:
-                    base = ann.annotation_quality_score
-                elif ann.failure_category and ann.failure_description:
-                    base += 0.2
-                annotation_quality = min(1.0, base)
+            annotation_quality = calculate_annotation_quality_score(op.annotation)
 
             quality_score = (completeness * 0.5 + annotation_quality * 0.5)
             op.quality_score = round(quality_score, 4)

@@ -150,11 +150,13 @@ class OverallStats(BaseModel):
 
 
 class QualityGradeRequest(BaseModel):
-    completeness_weight: float = Field(0.5, ge=0, le=1, description="完整度权重")
-    annotation_weight: float = Field(0.5, ge=0, le=1, description="标注质量权重")
-    grade_a_threshold: float = Field(0.9, ge=0, le=1, description="A级阈值")
-    grade_b_threshold: float = Field(0.7, ge=0, le=1, description="B级阈值")
-    grade_c_threshold: float = Field(0.5, ge=0, le=1, description="C级阈值")
+    # 数值区间、权重和容差与阈值顺序由 validate_grade_policy 统一校验，
+    # 以便在同一响应中指出全部无效字段（此处不加 ge/le，避免提前返回不一致的错误格式）。
+    completeness_weight: float = Field(0.5, description="完整度权重，取值区间[0,1]，与标注权重之和须为1（容差1e-6）")
+    annotation_weight: float = Field(0.5, description="标注质量权重，取值区间[0,1]，与完整度权重之和须为1（容差1e-6）")
+    grade_a_threshold: float = Field(0.9, description="A级阈值，取值区间[0,1]，须严格大于B级阈值")
+    grade_b_threshold: float = Field(0.7, description="B级阈值，取值区间[0,1]，须严格小于A级且严格大于C级")
+    grade_c_threshold: float = Field(0.5, description="C级阈值，取值区间[0,1]，须严格小于B级阈值")
 
 
 class DatasetVersionCreate(BaseModel):

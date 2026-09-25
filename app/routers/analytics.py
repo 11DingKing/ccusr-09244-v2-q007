@@ -14,10 +14,10 @@ from app.schemas.dataset import (
 )
 from app.services.scoring import (
     calculate_completeness_score,
-    calculate_annotation_quality_score,
-    determine_grade,
-    compute_operation_quality
+    GradePolicyError,
+    validate_grade_policy,
 )
+from app.services.grading import OperationNotFoundError, grade_operations
 from app.services.aggregation import compute_group_stats
 
 router = APIRouter()
@@ -29,49 +29,57 @@ def grade_operation_data(
     operation_ids: Optional[List[int]] = Query(None, description="指定作业ID列表，空则处理全部"),
     db: Session = Depends(get_db)
 ):
-    if req.completeness_weight + req.annotation_weight != 1.0:
-        raise HTTPException(status_code=400, detail="完整度权重和标注质量权重之和必须为1.0")
-
-    query = db.query(OperationData)
-    if operation_ids:
-        query = query.filter(OperationData.id.in_(operation_ids))
-    operations = query.all()
-
-    thresholds = {
-        "grade_a": req.grade_a_threshold,
-        "grade_b": req.grade_b_threshold,
-        "grade_c": req.grade_c_threshold
-    }
-
-    graded_count = 0
-    for op in operations:
-        annotation = db.query(Annotation).filter(
-            Annotation.operation_data_id == op.id
-        ).first()
-
-        scores = compute_operation_quality(
-            operation=op,
-            annotation=annotation,
+    # 先校验策略本身：权重区间、权重和容差、阈值取值区间与严格有序。
+    # 任意字段不合法都在读取/更新数据之前拒绝，原有等级不会被覆盖。
+    try:
+        policy = validate_grade_policy(
             completeness_weight=req.completeness_weight,
             annotation_weight=req.annotation_weight,
-            thresholds=thresholds
+            grade_a_threshold=req.grade_a_threshold,
+            grade_b_threshold=req.grade_b_threshold,
+            grade_c_threshold=req.grade_c_threshold,
+        )
+    except GradePolicyError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "质量分级策略不合法",
+                "field_errors": exc.field_errors,
+            },
         )
 
-        op.completeness_score = scores.completeness_score
-        op.quality_score = scores.quality_score
-        op.data_grade = scores.data_grade
-        graded_count += 1
-
-    db.commit()
-
-    grade_counts = {"A": 0, "B": 0, "C": 0, "D": 0}
-    for op in operations:
-        if op.data_grade in grade_counts:
-            grade_counts[op.data_grade] += 1
+    try:
+        result = grade_operations(db, policy, operation_ids)
+    except OperationNotFoundError as exc:
+        # 指定了不存在的作业编号：全部输入已先验证，未更新任何数据
+        db.rollback()
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "message": "部分作业数据不存在，未执行任何分级更新",
+                "field_errors": {"operation_ids": [f"作业编号不存在: {exc.missing_ids}"]},
+                "missing_operation_ids": exc.missing_ids,
+            },
+        )
+    except Exception:
+        # 评分或提交中途异常：回滚，保证原等级不被部分覆盖
+        db.rollback()
+        raise
 
     return {
-        "message": f"已完成 {graded_count} 条数据的质量分级",
-        "grade_distribution": grade_counts
+        "message": f"已完成 {result.graded_count} 条数据的质量分级",
+        "graded_count": result.graded_count,
+        "total": result.total,
+        "grade_distribution": result.grade_distribution,
+        "items": [
+            {
+                "operation_id": item.operation_id,
+                "completeness_score": item.completeness_score,
+                "quality_score": item.quality_score,
+                "data_grade": item.data_grade,
+            }
+            for item in result.items
+        ],
     }
 
 
